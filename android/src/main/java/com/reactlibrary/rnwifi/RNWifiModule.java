@@ -3,6 +3,7 @@ package com.reactlibrary.rnwifi;
 import static com.reactlibrary.rnwifi.mappers.WifiScanResultsMapper.mapWifiScanResults;
 
 import android.Manifest;
+import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -18,13 +19,18 @@ import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.net.wifi.WifiNetworkSpecifier;
+import android.net.wifi.WifiNetworkSuggestion;
 import android.os.Build;
+import android.os.Bundle;
 import android.provider.Settings;
+import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 
+import com.facebook.react.bridge.ActivityEventListener;
+import com.facebook.react.bridge.BaseActivityEventListener;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
@@ -47,13 +53,56 @@ import com.thanosfisherman.wifiutils.wifiRemove.RemoveErrorCode;
 import com.thanosfisherman.wifiutils.wifiRemove.RemoveSuccessListener;
 
 import java.util.List;
+import java.util.ArrayList;
+import java.util.concurrent.ExecutionException;
 
 public class RNWifiModule extends ReactContextBaseJavaModule {
     private final WifiManager wifi;
     private final ReactApplicationContext context;
 
+    private static final int ADD_NETWORK_CODE = 545;
+    private Promise mAddWifiPromise;
+
+    private final ActivityEventListener mActivityEventListener = new BaseActivityEventListener() {
+        @Override
+        public void onActivityResult(Activity activity, int requestCode, int resultCode, Intent intent) {
+            Log.i("WifiNetworkSuggestion", "Add networks intent - own function - resultCode: " +  resultCode);
+            Log.i("WifiNetworkSuggestion", "own function - requestCode: " +  requestCode);
+
+            if (requestCode == ADD_NETWORK_CODE) {
+                if (mAddWifiPromise != null) {
+                    Log.i("WifiNetworkSuggestion", "requestCode check true");
+                    if (resultCode == Activity.RESULT_OK) {
+                        Log.i("WifiNetworkSuggestion", "resultCode check OK");
+                        if (intent != null && intent.hasExtra(Settings.EXTRA_WIFI_NETWORK_RESULT_LIST)) {
+                            for (int code : intent.getIntegerArrayListExtra(Settings.EXTRA_WIFI_NETWORK_RESULT_LIST)) {
+                                Log.i("WifiNetworkSuggestion", "own function - code: " +  code);
+                                switch (code) {
+                                    case Settings.ADD_WIFI_RESULT_ADD_OR_UPDATE_FAILED: {
+                                        mAddWifiPromise.reject(String.valueOf(Settings.ADD_WIFI_RESULT_ADD_OR_UPDATE_FAILED), "ADD_WIFI_RESULT_ADD_OR_UPDATE_FAILED");
+                                    }
+                                    case Settings.ADD_WIFI_RESULT_ALREADY_EXISTS: {
+                                        mAddWifiPromise.reject(String.valueOf(Settings.ADD_WIFI_RESULT_ALREADY_EXISTS), "ADD_WIFI_RESULT_ALREADY_EXISTS");
+                                    }
+                                    default:
+                                    case Settings.ADD_WIFI_RESULT_SUCCESS: {
+                                        mAddWifiPromise.resolve(true);
+                                    }
+                                }
+                            }
+                        }
+                    }  else {
+                        mAddWifiPromise.reject(String.valueOf(Activity.RESULT_CANCELED), "RESULT_CANCELED");
+                    }
+                    mAddWifiPromise = null;
+                }
+            }
+        }
+    };
+
     RNWifiModule(ReactApplicationContext context) {
         super(context);
+        context.addActivityEventListener(mActivityEventListener);
 
         // TODO: get when needed
         wifi = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
@@ -348,6 +397,16 @@ public class RNWifiModule extends ReactContextBaseJavaModule {
         removeWifiNetwork(SSID, promise, null);
     }
 
+    /**
+     * This method will open the Quick Panel for changing wifi configuration.
+     */
+    @ReactMethod
+    public void openWifiPanel() {
+        // Quick Panel Nachteil: hat einen Mehr-Button, der die Android Einstellungen öffnet
+        Intent panelIntent = new Intent(Settings.Panel.ACTION_WIFI);
+        getCurrentActivity().startActivityForResult(panelIntent, 0);
+    }
+
     private void removeWifiNetwork(final String SSID, final Promise promise, final Runnable onSuccess) {
         final boolean locationPermissionGranted = PermissionUtils.isLocationPermissionGranted(context);
         if (!locationPermissionGranted) {
@@ -399,7 +458,9 @@ public class RNWifiModule extends ReactContextBaseJavaModule {
     }
 
     private void connectToWifiDirectly(@NonNull final String SSID, @NonNull final String password, final Promise promise) {
-        if (isAndroidTenOrLater()) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            connectAndroidR(SSID, password, promise);
+        } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q) {
             connectAndroidQ(SSID, password, promise);
         } else {
             connectPreAndroidQ(SSID, password, promise);
@@ -438,50 +499,65 @@ public class RNWifiModule extends ReactContextBaseJavaModule {
 
     @RequiresApi(api = Build.VERSION_CODES.Q)
     private void connectAndroidQ(@NonNull final String SSID, @NonNull final String password, final Promise promise) {
-        WifiNetworkSpecifier.Builder wifiNetworkSpecifier = new WifiNetworkSpecifier.Builder()
-                .setSsid(SSID);
 
-        if (!isNullOrEmpty(password)) {
-            wifiNetworkSpecifier.setWpa2Passphrase(password);
+        WifiNetworkSuggestion suggestion =
+                new WifiNetworkSuggestion.Builder()
+                        .setSsid(SSID)
+                        .setWpa2Passphrase(password)
+                        .build();
+
+        WifiManager wifiManager =
+                (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+
+        ArrayList<WifiNetworkSuggestion> suggestionsList =
+                new ArrayList<WifiNetworkSuggestion>();
+
+        suggestionsList.add(suggestion);
+
+        int status = wifiManager.addNetworkSuggestions(suggestionsList);
+        Log.i("WifiNetworkSuggestion", "Adding Network suggestions status is $status");
+
+        if (status != WifiManager.STATUS_NETWORK_SUGGESTIONS_SUCCESS) {
+            int removeStatus = wifiManager.removeNetworkSuggestions(suggestionsList);
+            Log.i("WifiNetworkSuggestion", "Removing Network suggestions status: " + removeStatus);
+            promise.reject("failed addNetworkSuggestions - status: " + status);
         }
 
-        NetworkRequest nr = new NetworkRequest.Builder()
-                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                .setNetworkSpecifier(wifiNetworkSpecifier.build())
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
-                .build();
+        promise.resolve("successfully addNetworkSuggestions - status: " + status);
+    }
 
-        ConnectivityManager connectivityManager = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+    @RequiresApi(api = Build.VERSION_CODES.R)
+    private void connectAndroidR(@NonNull final String SSID, @NonNull final String password, final Promise promise) {
+        // Store the promise to resolve/reject when picker returns data
+        mAddWifiPromise = promise;
 
-        ConnectivityManager.NetworkCallback networkCallback = new
-                ConnectivityManager.NetworkCallback() {
-                    @Override
-                    public void onAvailable(Network network) {
-                        super.onAvailable(network);
-                        DisconnectCallbackHolder.getInstance().bindProcessToNetwork(network);
-                        connectivityManager.setNetworkPreference(ConnectivityManager.DEFAULT_NETWORK_PREFERENCE);
-                        if (!pollForValidSSID(3, SSID)) {
-                            promise.reject(ConnectErrorCodes.android10ImmediatelyDroppedConnection.toString(), "Firmware bugs on OnePlus prevent it from connecting on some firmware versions.");
-                            return;
-                        }
-                        promise.resolve("connected");
-                    }
+        WifiNetworkSuggestion suggestion =
+                new WifiNetworkSuggestion.Builder()
+                        .setSsid(SSID)
+                        .setWpa2Passphrase(password)
+                        .build();
 
-                    @Override
-                    public void onUnavailable() {
-                        super.onUnavailable();
-                        promise.reject(ConnectErrorCodes.userDenied.toString(), "On Android 10, the user cancelled connecting (via System UI).");
-                    }
+        WifiManager wifiManager =
+                (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
 
-                    @Override
-                    public void onLost(@NonNull Network network) {
-                        super.onLost(network);
-                        DisconnectCallbackHolder.getInstance().unbindProcessFromNetwork();
-                        DisconnectCallbackHolder.getInstance().disconnect();
-                    }
-                };
-        DisconnectCallbackHolder.getInstance().addNetworkCallback(networkCallback, connectivityManager);
-        DisconnectCallbackHolder.getInstance().requestNetwork(nr);
+        ArrayList<WifiNetworkSuggestion> suggestionsList =
+                new ArrayList<WifiNetworkSuggestion>();
+
+        suggestionsList.add(suggestion);
+
+        try {
+            // Create intent
+            Bundle bundle = new Bundle();
+            bundle.putParcelableArrayList(Settings.EXTRA_WIFI_NETWORK_LIST, suggestionsList);
+            Intent intent = new Intent(Settings.ACTION_WIFI_ADD_NETWORKS);
+            intent.putExtras(bundle);
+
+            // Launch intent
+            getCurrentActivity().startActivityForResult(intent, ADD_NETWORK_CODE);
+        } catch (Exception e) {
+            mAddWifiPromise.reject("E_FAILED_TO_ADD_NETWORK", e);
+            mAddWifiPromise = null;
+        }
     }
 
     private static String longToIP(int longIp) {
@@ -531,13 +607,6 @@ public class RNWifiModule extends ReactContextBaseJavaModule {
         }
 
         return ssid;
-    }
-
-    /**
-     * @return true if the current sdk is above or equal to Android Q
-     */
-    private boolean isAndroidTenOrLater() {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q;
     }
 
     /**
